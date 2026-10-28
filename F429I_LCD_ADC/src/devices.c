@@ -72,8 +72,17 @@ void HAL_LTDC_LineEvenCallback(LTDC_HandleTypeDef *hltdc)
 
 void initGPIO(void)
 {
-    BSP_LED_Init(LED3);
+    BSP_LED_Init(LED4);
+
     BSP_PB_Init(BUTTON_KEY, BUTTON_MODE_GPIO);
+
+    __HAL_RCC_GPIOG_CLK_ENABLE();
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	GPIO_InitStruct.Pin = GPIO_PIN_13;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 }
 
 /**
@@ -87,49 +96,49 @@ void initGPIO(void)
  */
 void initADC(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct;
-    ADC_ChannelConfTypeDef ADC_ChannelStruct;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    /* Configure GPIO C1 */
-    __GPIOC_CLK_ENABLE();
+    /* Configure GPIO C1 (ADC1_IN11) */
+    __HAL_RCC_GPIOC_CLK_ENABLE();
     GPIO_InitStruct.Pin = GPIO_PIN_1;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+    /* Configure GPIO A5 (ADC1_IN5) */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
     /* Add ADC1 IRQ to NVIC */
     HAL_NVIC_SetPriority(ADC_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(ADC_IRQn);
 
     /* Configure ADC */
-    __ADC1_CLK_ENABLE();
+    __HAL_RCC_ADC1_CLK_ENABLE();
     gAdcHandle.Instance = ADC1;
-    gAdcHandle.Init.ClockPrescaler = ADC_CLOCKPRESCALER_PCLK_DIV8;  // prescaler on TIM2
+    gAdcHandle.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
     gAdcHandle.Init.Resolution = ADC_RESOLUTION_12B;
     gAdcHandle.Init.ScanConvMode = DISABLE;
-    gAdcHandle.Init.ContinuousConvMode = ENABLE;
+    gAdcHandle.Init.ContinuousConvMode = DISABLE;
     gAdcHandle.Init.DiscontinuousConvMode = DISABLE;
     gAdcHandle.Init.NbrOfDiscConversion = 0;
-    gAdcHandle.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;  // TIM2 is trigger
+    gAdcHandle.Init.ExternalTrigConv = ADC_SOFTWARE_START;            // Software triggered for polling
     gAdcHandle.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
     gAdcHandle.Init.DataAlign = ADC_DATAALIGN_RIGHT;
     gAdcHandle.Init.NbrOfConversion = 1;
-    gAdcHandle.Init.DMAContinuousRequests = ENABLE;
-    gAdcHandle.Init.EOCSelection = DISABLE;
-    HAL_ADC_Init(&gAdcHandle);
+    gAdcHandle.Init.DMAContinuousRequests = DISABLE;                   // Disabled since DMA is unused
+    gAdcHandle.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
 
-    /* Configure ADC Channel */
-    ADC_ChannelStruct.Channel = ADC_CHANNEL_11;
-    ADC_ChannelStruct.SamplingTime = ADC_SAMPLETIME_480CYCLES;
-    ADC_ChannelStruct.Rank = 1;
-    ADC_ChannelStruct.Offset = 0;
-    HAL_ADC_ConfigChannel(&gAdcHandle, &ADC_ChannelStruct);
-
-    /* Start ADC Conversion */
-    HAL_ADC_Start_IT(&gAdcHandle);
+    if (HAL_ADC_Init(&gAdcHandle) != HAL_OK)
+    {
+//        Error_Handler();
+    }
 }
-
 /**
  *
  * Initialize and configure Timer.
@@ -144,9 +153,9 @@ void initTimer(void)
     __TIM2_CLK_ENABLE();
 
     /* Timer 2 initialization and configuration */
-    gTimHandle.Instance = TIM2;                             // base 180 MHz
-    gTimHandle.Init.Period = 1000 - 1;                      // 180 KHz
-    gTimHandle.Init.Prescaler = (90000000 / 40000000) - 1;  // 90 KHz
+    gTimHandle.Instance = TIM2;                  // TIM2 clock = 90 MHz (APB1 45 MHz x2)
+    gTimHandle.Init.Prescaler = 90 - 1;          // 90 MHz / 90 = 1 MHz -> 1 µs per tick
+    gTimHandle.Init.Period    = 20000 - 1;       // 20 000 µs = 20 ms -> 50 Hz frame
     gTimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
     gTimHandle.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     gTimHandle.Init.RepetitionCounter = 0;
