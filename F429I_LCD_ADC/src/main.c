@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "stm32f4xx.h"
 #include "stm32f429i_discovery.h"
 #include "../Components/ili9341/ili9341.h"
@@ -11,31 +12,39 @@
 #include "task.h"
 #include "queue.h"
 
+typedef enum { STATE_STOP, STATE_TRACK_ANIM, STATE_TRACK_DEBUG } state_t;
+typedef enum { EVT_BTN, EVT_LIGHT } event_type_t;
+
 typedef struct {
+    event_type_t type;
     uint16_t left;
     uint16_t right;
-} light_t;
+} event_t;
 
-static QueueHandle_t light_queue;
+typedef struct {
+    state_t state;
+    uint16_t left;
+    uint16_t right;
+    int angle;
+} display_t;
+
+QueueHandle_t event_queue;
+QueueHandle_t display_queue;
 
 /* ******************************************************
 -      Global Context
 - ******************************************************/
 
-#define LIGHT_THRESHOLD 150
+#define START_THRESHOLD 1000
+#define LIGHT_THRESHOLD 100
 #define SERVO_MIN_ANGLE 0
 #define SERVO_MAX_ANGLE 180
 
-int cycle = 0;
-int nbTIM2 = 0;
 
-/* Servo pulse state (in timer ticks / us) */
-volatile int ServoON = 1500;  // Default 1.5ms (90 degrees center)
+volatile int ServoON = 1500;  // Default 1.5ms
 volatile int servo_curr_angle = 90;
 
-volatile uint16_t adc_buffer[2];
-ADC_HandleTypeDef hadc1;
-TaskHandle_t xDisplayHandle = NULL;
+volatile int adc_channel = 0;
 
 /* ******************************************************
 -      Servo Control Helper
@@ -48,115 +57,127 @@ void set_servo_angle(int angle)
 
     servo_curr_angle = angle;
 
-    ServoON = 500 + ((uint32_t)angle * 2000) / 180;
+    ServoON = 500 + (angle * 2000) / 180;
 }
 
-uint16_t read_adc_channel(uint32_t channel)
+void start_adc(void)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
 
-    sConfig.Channel = channel;
+    sConfig.Channel = adc_channel ? ADC_CHANNEL_5 : ADC_CHANNEL_11;
     sConfig.Rank = 1;
     sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
 
-    if (HAL_ADC_ConfigChannel(&gAdcHandle, &sConfig) != HAL_OK)
-    {
-        return 0;
-    }
-
-    HAL_ADC_Start(&gAdcHandle);
-
-    if (HAL_ADC_PollForConversion(&gAdcHandle, 10) == HAL_OK)
-    {
-        uint16_t value = (uint16_t)HAL_ADC_GetValue(&gAdcHandle);
-        HAL_ADC_Stop(&gAdcHandle);
-        return value;
-    }
-
-    HAL_ADC_Stop(&gAdcHandle);
-    return 0;
+    HAL_ADC_ConfigChannel(&gAdcHandle, &sConfig);
+    HAL_ADC_Start_IT(&gAdcHandle);
 }
 
 /* ******************************************************
 -      Tasks
 - ******************************************************/
 
-void task_servo(void *p)
+void task_automate(void *p)
 {
-    TickType_t last = xTaskGetTickCount();
-    light_t l;
-
-    set_servo_angle(90);
+    state_t state = STATE_STOP;
+    int left = 0;
+    int right = 0;
+    event_t evt;
 
     for (;;)
     {
-        if (xQueuePeek(light_queue, &l, 0) == pdTRUE)
+        if (xQueueReceive(event_queue, &evt, pdMS_TO_TICKS(50)) == pdTRUE)
         {
-            int32_t diff = (int32_t)l.left - (int32_t)l.right;
+            if (evt.type == EVT_LIGHT)
+            {
+                left = evt.left;
+                right = evt.right;
+            }
+            else if (state == STATE_TRACK_ANIM)
+                state = STATE_TRACK_DEBUG;
+            else
+                state = STATE_TRACK_ANIM;
+        }
 
+        int diff = left - right;
+
+        if (state == STATE_STOP && abs(diff) > START_THRESHOLD)
+            state = STATE_TRACK_ANIM;
+
+        if (state != STATE_STOP)
+        {
             if (diff > LIGHT_THRESHOLD)
                 set_servo_angle(servo_curr_angle + 2);
             else if (diff < -LIGHT_THRESHOLD)
                 set_servo_angle(servo_curr_angle - 2);
         }
 
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(50));
+        display_t d = { state, left, right, servo_curr_angle };
+        xQueueOverwrite(display_queue, &d);
     }
 }
 
-void task_sensor(void *p)
+void task_servo(void *p)
 {
-    TickType_t last = xTaskGetTickCount();
-    light_t l;
-
     for (;;)
     {
-        l.left  = read_adc_channel(ADC_CHANNEL_11);
-        l.right = read_adc_channel(ADC_CHANNEL_5);
-        xQueueOverwrite(light_queue, &l);
+        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13, GPIO_PIN_SET);
+        __HAL_TIM_SET_COMPARE(&gTimHandle, TIM_CHANNEL_1, (__HAL_TIM_GET_COUNTER(&gTimHandle) + ServoON) % 20000);
+        __HAL_TIM_CLEAR_FLAG(&gTimHandle, TIM_FLAG_CC1);
+        __HAL_TIM_ENABLE_IT(&gTimHandle, TIM_IT_CC1);
 
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 void task_display(void *p)
 {
     char msg[20] = {0};
-    bool toggled = false;
-    bool prev_pressed = false;
-    uint32_t back_color = LCD_COLOR_LIGHTGRAY;
-    uint32_t text_color = LCD_COLOR_BLACK;
-    light_t l = {0};
-
-    LCDdisplayInit(COLORS_NORMAL);
+    display_t d;
+    int shown = -1;
+    int eye_x = 0;
 
     for (;;)
     {
-        bool pressed = (BSP_PB_GetState(BUTTON_KEY) != 0);
-        if (pressed && !prev_pressed)
+        xQueueReceive(display_queue, &d, portMAX_DELAY);
+
+        if (d.state != shown)
         {
-            toggled = !toggled;
-            BSP_LED_Toggle(LED4);
-            LCDdisplayInit(toggled ? COLORS_REVERSE : COLORS_NORMAL);
-            back_color = toggled ? LCD_COLOR_DARKGRAY : LCD_COLOR_LIGHTGRAY;
-            text_color = toggled ? LCD_COLOR_WHITE : LCD_COLOR_BLACK;
+            shown = d.state;
+            LCDdisplayInit(COLORS_NORMAL);
+            BSP_LCD_SetBackColor(LCD_COLOR_LIGHTGRAY);
+
+            if (d.state == STATE_STOP)
+                LCDdisplayText(7, LCD_COLOR_BLACK, "zzz...");
+
+            if (d.state == STATE_TRACK_ANIM)
+            {
+                BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+                BSP_LCD_DrawEllipse(120, 160, 105, 40);
+            }
         }
-        prev_pressed = pressed;
 
-        xQueuePeek(light_queue, &l, 0);
+        if (d.state == STATE_TRACK_ANIM)
+        {
+            // erase old pupil, draw new one
+            BSP_LCD_SetTextColor(LCD_COLOR_LIGHTGRAY);
+            BSP_LCD_FillCircle(eye_x, 160, 15);
 
-        BSP_LCD_SetBackColor(back_color);
+            eye_x = 50 + d.angle * 140 / 180;
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+            BSP_LCD_FillCircle(eye_x, 160, 15);
+        }
 
-        snprintf(msg, sizeof(msg), "Right: %4u", l.right);
-        LCDdisplayText(5, text_color, msg);
+        if (d.state == STATE_TRACK_DEBUG)
+        {
+            snprintf(msg, sizeof(msg), "Right: %4u", d.right);
+            LCDdisplayText(5, LCD_COLOR_BLACK, msg);
 
-        snprintf(msg, sizeof(msg), "Left:  %4u", l.left);
-        LCDdisplayText(8, LCD_COLOR_GREEN, msg);
+            snprintf(msg, sizeof(msg), "Left:  %4u", d.left);
+            LCDdisplayText(8, LCD_COLOR_GREEN, msg);
 
-        snprintf(msg, sizeof(msg), "%3d deg", servo_curr_angle);
-        LCDdisplayText(10, LCD_COLOR_BLUE, msg);
-
-        vTaskDelay(pdMS_TO_TICKS(100));
+            snprintf(msg, sizeof(msg), "%3d deg", d.angle);
+            LCDdisplayText(10, LCD_COLOR_BLUE, msg);
+        }
     }
 }
 
@@ -165,10 +186,8 @@ int main(void)
 {
     setup();
 
-    light_queue = xQueueCreate(1, sizeof(light_t));
-    configASSERT(light_queue != NULL);
-    xTaskCreate(task_sensor,  "sensor",  256, NULL, tskIDLE_PRIORITY + 3, NULL);
-    xTaskCreate(task_servo,   "servo",   256, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(task_servo, "servo", 256, NULL, tskIDLE_PRIORITY + 3, NULL);
+    xTaskCreate(task_automate, "automate", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(task_display, "display", 512, NULL, tskIDLE_PRIORITY + 1, NULL);
 
     vTaskStartScheduler();
@@ -182,17 +201,15 @@ int main(void)
 
 void TIM2_IRQHandler(void)
 {
-    // Frame Start (Every 20ms) => Drive PG13 HIGH
+    // Every 20ms
     if (__HAL_TIM_GET_IT_SOURCE(&gTimHandle, TIM_IT_UPDATE) != RESET &&
         __HAL_TIM_GET_FLAG(&gTimHandle, TIM_FLAG_UPDATE) != RESET)
     {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13, GPIO_PIN_SET);
-        __HAL_TIM_SET_COMPARE(&gTimHandle, TIM_CHANNEL_1, ServoON);
-        __HAL_TIM_ENABLE_IT(&gTimHandle, TIM_IT_CC1);
+        start_adc();
         __HAL_TIM_CLEAR_IT(&gTimHandle, TIM_IT_UPDATE);
     }
 
-    // Pulse Duration Complete  => Drive PG13 LOW
+    // Pulse Duration Complete
     if (__HAL_TIM_GET_IT_SOURCE(&gTimHandle, TIM_IT_CC1) != RESET &&
         __HAL_TIM_GET_FLAG(&gTimHandle, TIM_FLAG_CC1) != RESET)
     {
@@ -204,7 +221,33 @@ void TIM2_IRQHandler(void)
 
 void ADC_IRQHandler(void)
 {
-    HAL_ADC_IRQHandler(&hadc1);
+    static uint16_t light[2];
+    uint16_t value = HAL_ADC_GetValue(&gAdcHandle);
+
+    if (abs(value - light[adc_channel]) > LIGHT_THRESHOLD)
+    {
+        light[adc_channel] = value;
+        event_t evt = { EVT_LIGHT, light[0], light[1] };
+        xQueueSendFromISR(event_queue, &evt, NULL);
+    }
+
+    adc_channel = !adc_channel;
+}
+
+void EXTI0_IRQHandler(void)
+{
+    static TickType_t last_press = 0;
+    TickType_t now = xTaskGetTickCountFromISR();
+
+    __HAL_GPIO_EXTI_CLEAR_IT(KEY_BUTTON_PIN);
+
+    // debounce
+    if (now - last_press > pdMS_TO_TICKS(200))
+    {
+        event_t evt = { EVT_BTN, 0, 0 };
+        xQueueSendFromISR(event_queue, &evt, NULL);
+    }
+    last_press = now;
 }
 
 void Error_Handler(void)
@@ -223,7 +266,10 @@ void setup(void)
     HAL_Init();
     SystemClock_Config();
     initLCD();
+    // important!!
+    event_queue = xQueueCreate(8, sizeof(event_t));
+    display_queue = xQueueCreate(1, sizeof(display_t));
     initGPIO();
-    initTimer();
     initADC();
+    initTimer();
 }
